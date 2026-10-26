@@ -17,8 +17,14 @@ class ZegoCallController extends ChangeNotifier {
   ZegoCallController({
     required this.engineConfig,
     required this.callConfig,
+    @visibleForTesting
+    Future<ZegoEngine> Function(ZegoEngineConfig config)? engineFactory,
   }) : _currentLayout = callConfig.layout,
-       _hideNoVideoTiles = callConfig.hideNoVideoTiles;
+       _hideNoVideoTiles = callConfig.hideNoVideoTiles,
+       _engineFactory = engineFactory;
+
+  /// Test hook that replaces [ZegoWeb.loadScript] + [ZegoWeb.createEngine].
+  final Future<ZegoEngine> Function(ZegoEngineConfig config)? _engineFactory;
 
   /// Engine configuration used to create the [ZegoEngine] on [join].
   final ZegoEngineConfig engineConfig;
@@ -193,8 +199,7 @@ class ZegoCallController extends ChangeNotifier {
     ZegoLog.info('CallController.startPreview');
 
     try {
-      await ZegoWeb.loadScript();
-      _engine = await ZegoWeb.createEngine(engineConfig);
+      _engine = await _createEngine();
       _debugMicLevelSub?.cancel();
       _debugMicLevelSub = _engine!.debugLocalMicLevel.listen((level) {
         if (!_debugMicLevelController.isClosed) _debugMicLevelController.add(level);
@@ -235,8 +240,7 @@ class ZegoCallController extends ChangeNotifier {
 
     try {
       if (_engine == null) {
-        await ZegoWeb.loadScript();
-        _engine = await ZegoWeb.createEngine(engineConfig);
+        _engine = await _createEngine();
         _debugMicLevelSub?.cancel();
         _debugMicLevelSub = _engine!.debugLocalMicLevel.listen((level) {
           if (!_debugMicLevelController.isClosed) _debugMicLevelController.add(level);
@@ -301,21 +305,55 @@ class ZegoCallController extends ChangeNotifier {
     } on ZegoError catch (e) {
       ZegoLog.error('CallController.join failed: $e');
       _lastError = e;
+      await _rollBackFailedJoin();
       _setState(ZegoCallState.idle);
       notifyListeners();
       rethrow;
     } catch (e) {
       ZegoLog.error('CallController.join failed: $e');
       _lastError = ZegoError(-1, e.toString());
+      await _rollBackFailedJoin();
       _setState(ZegoCallState.idle);
       notifyListeners();
       rethrow;
     }
   }
 
+  Future<ZegoEngine> _createEngine() async {
+    if (_engineFactory != null) return _engineFactory(engineConfig);
+    await ZegoWeb.loadScript();
+    return ZegoWeb.createEngine(engineConfig);
+  }
+
+  /// Undo the parts of a failed [join] that would block the next attempt.
+  ///
+  /// [join] logs in to the room before creating and publishing the local
+  /// stream. If a later step fails (e.g. camera blocked), the engine is still
+  /// logged in, and the next [join] is rejected by the SDK with 1002001
+  /// ("login rooms exceeds the upper limit"). The engine and any preview
+  /// stream are kept so the pre-join view keeps working; [leave] or
+  /// [dispose] tear them down.
+  Future<void> _rollBackFailedJoin() async {
+    for (final sub in _subscriptions) {
+      await sub.cancel();
+    }
+    _subscriptions.clear();
+    _participants.clear();
+    _remoteStreams.clear();
+
+    try {
+      // No-op when loginRoom itself failed.
+      await _engine?.logoutRoom();
+    } catch (e) {
+      ZegoLog.warn('CallController.join rollback logout error: $e');
+    }
+  }
+
   /// Leave the call and tear down the engine.
   Future<void> leave() async {
-    if (_state == ZegoCallState.idle || _state == ZegoCallState.leaving) return;
+    if (_state == ZegoCallState.leaving) return;
+    // Idle with a live engine happens after a failed join — still tear down.
+    if (_state == ZegoCallState.idle && _engine == null) return;
     _setState(ZegoCallState.leaving);
     ZegoLog.info('CallController.leave room=${callConfig.roomId}');
 
@@ -747,7 +785,7 @@ class ZegoCallController extends ChangeNotifier {
     _disposed = true;
     _debugLogController.close(); // broadcast; safe even with no subscribers
     _debugMicLevelController.close();
-    if (_state != ZegoCallState.idle) leave();
+    if (_state != ZegoCallState.idle || _engine != null) leave();
     super.dispose();
   }
 }

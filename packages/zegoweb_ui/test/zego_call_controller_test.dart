@@ -9,6 +9,8 @@ import 'package:zegoweb_ui/src/zego_call_controller.dart';
 import 'package:zegoweb_ui/src/zego_call_state.dart';
 import 'package:zegoweb_ui/src/zego_layout_mode.dart';
 
+import 'fixtures/fake_zego_js.dart';
+
 void main() {
   group('ZegoCallController', () {
     late ZegoCallController controller;
@@ -115,6 +117,91 @@ void main() {
       test('debugMicLevel returns a stream', () {
         expect(controller.debugMicLevel, isA<Stream<double>>());
       });
+    });
+  });
+
+  // A join that fails after loginRoom must log out, otherwise the next join
+  // is rejected by the SDK with 1002001 ("login rooms exceeds the upper
+  // limit").
+  group('ZegoCallController failed join', () {
+    late FakeZegoJs fake;
+    late ZegoCallController controller;
+    var disposed = false;
+
+    setUp(() {
+      fake = FakeZegoJs();
+      disposed = false;
+      controller = ZegoCallController(
+        engineConfig: ZegoEngineConfig(
+          appId: 1,
+          server: 'wss://example.com',
+          scenario: ZegoScenario.communication,
+          tokenProvider: () async => 'token',
+        ),
+        callConfig: const ZegoCallConfig(roomId: 'r1', userId: 'u1'),
+        engineFactory: (config) async => ZegoEngine.test(
+          js: fake.asJs(),
+          tokenProvider: config.tokenProvider,
+        ),
+      );
+    });
+
+    tearDown(() {
+      if (!disposed) controller.dispose();
+    });
+
+    test('logs out of the room when creating the local stream fails',
+        () async {
+      fake.rejectNextCreateStream(
+        jsName: 'NotAllowedError',
+        message: 'Permission denied',
+      );
+
+      await expectLater(controller.join(), throwsA(isA<ZegoError>()));
+
+      expect(fake.loginCalls, hasLength(1));
+      expect(fake.logoutCalls, ['r1']);
+      expect(controller.state, ZegoCallState.idle);
+      expect(controller.lastError, isNotNull);
+    });
+
+    test('does not log out when loginRoom itself fails', () async {
+      fake.rejectNextLogin(code: 1102016, message: 'token error');
+
+      await expectLater(controller.join(), throwsA(isA<ZegoError>()));
+
+      expect(fake.logoutCalls, isEmpty);
+      expect(controller.state, ZegoCallState.idle);
+    });
+
+    // Mirrors the BUGS-372 repro: camera still blocked, Join tapped twice.
+    // Before the fix the second loginRoom ran while still logged in.
+    test('a second failed join logs in and out again', () async {
+      for (var i = 0; i < 2; i++) {
+        fake.rejectNextCreateStream(
+          jsName: 'NotAllowedError',
+          message: 'Permission denied',
+        );
+        await expectLater(controller.join(), throwsA(isA<ZegoError>()));
+      }
+
+      expect(fake.loginCalls, hasLength(2));
+      expect(fake.logoutCalls, ['r1', 'r1']);
+      expect(controller.state, ZegoCallState.idle);
+    });
+
+    test('dispose after a failed join destroys the engine', () async {
+      fake.rejectNextCreateStream(
+        jsName: 'NotAllowedError',
+        message: 'Permission denied',
+      );
+      await expectLater(controller.join(), throwsA(isA<ZegoError>()));
+
+      controller.dispose();
+      disposed = true;
+      await Future<void>.delayed(Duration.zero);
+
+      expect(fake.callCounts['destroyEngine'], 1);
     });
   });
 }
